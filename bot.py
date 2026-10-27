@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Игровой центр (Крестики-нолики и Цифровой Wordle)
+# Игровой центр + Тайный Санта
 
 import asyncio
 import logging
@@ -26,6 +26,10 @@ bot_games = {}
 bot_scores = {}
 wordle_games = {}     
 waiting_for_code = {}
+santa_games = {} 
+waiting_for_santa_code = {} 
+waiting_for_santa_name = {} # user_id -> room_code (для входа)
+waiting_for_creator_name = {} # user_id -> count (для создателя)
 
 def init_db():
     conn = sqlite3.connect("game.db")
@@ -69,6 +73,7 @@ def get_main_menu_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Крестики-нолики", callback_data="menu:tictactoe")
     builder.button(text="🔢 Цифровой Wordle", callback_data="wordle:bot")
+    builder.button(text="🎅 Тайный Санта", callback_data="menu:santa")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -115,6 +120,22 @@ def get_game_over_keyboard(game_prefix):
     builder.adjust(1)
     return builder.as_markup()
 
+def get_santa_menu_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎄 Создать комнату", callback_data="santa:create")
+    builder.button(text="🔑 Войти в комнату", callback_data="santa:join")
+    builder.button(text="🔙 Назад", callback_data="mode:main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_santa_count_keyboard():
+    builder = InlineKeyboardBuilder()
+    for i in range(2, 11):
+        builder.button(text=str(i), callback_data=f"santa_count:{i}")
+    builder.button(text="🔙 Отмена", callback_data="menu:santa")
+    builder.adjust(5, 5, 1)
+    return builder.as_markup()
+
 # --- Главное меню ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -125,7 +146,7 @@ async def back_to_main(callback: types.CallbackQuery):
     await callback.message.edit_text("🎮 <b>Игровой центр</b>\n\nВыбери игру:", parse_mode="HTML", reply_markup=get_main_menu_keyboard())
     await callback.answer()
 
-# --- Меню игр (с правилами) ---
+# --- Меню игр ---
 @dp.callback_query(F.data == "menu:tictactoe")
 async def menu_tictactoe(callback: types.CallbackQuery):
     text = (
@@ -179,13 +200,169 @@ async def wordle_bot_start(callback: types.CallbackQuery):
     await callback.answer()
 
 # ==========================================
-# ОБРАБОТЧИК ТЕКСТА (ТОЛЬКО WORDLE И ВВОД КОДА)
+# ТАЙНЫЙ САНТА
+# ==========================================
+@dp.callback_query(F.data == "menu:santa")
+async def menu_santa(callback: types.CallbackQuery):
+    text = (
+        "🎅 <b>Тайный Санта</b> 🎄\n\n"
+        "📜 <b>Как это работает:</b>\n"
+        "1. Создатель комнаты выбирает количество участников (2-10).\n"
+        "2. Бот выдаёт код комнаты. Создатель скидывает код друзьям.\n"
+        "3. Друзья заходят в бота, нажимают «Войти в комнату», вводят код и пишут своё имя.\n"
+        "4. Когда все зашли, бот тайно распределяет, кто кому дарит подарок, и присылает каждому имя в личку.\n\n"
+        "Выбери действие:"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_santa_menu_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "santa:create")
+async def santa_create(callback: types.CallbackQuery):
+    text = "🎄 <b>Создание комнаты</b>\n\nВыбери общее количество участников (включая тебя):"
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_santa_count_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("santa_count:"))
+async def santa_count_selected(callback: types.CallbackQuery):
+    count = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    
+    # Запоминаем, что создатель выбрал количество и теперь должен ввести имя
+    waiting_for_creator_name[user_id] = count
+    
+    await callback.message.edit_text(
+        "🎅 Отлично! Теперь напиши своё имя (как тебя будут называть в игре):"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "santa:join")
+async def santa_join_prompt(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    waiting_for_santa_code[user_id] = True
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Отмена", callback_data="menu:santa")
+    await callback.message.edit_text(
+        "🔑 <b>Вход в комнату</b>\n\n"
+        "Напиши 4-значный код комнаты, который тебе дал создатель:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+# ==========================================
+# ОБРАБОТЧИК ТЕКСТА
 # ==========================================
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_all_text_input(message: types.Message):
     user_id = message.from_user.id
     
-    # --- Ввод для Цифрового Wordle (с ботом) ---
+    # --- Ожидание имени СОЗДАТЕЛЯ ---
+    if user_id in waiting_for_creator_name:
+        count = waiting_for_creator_name.pop(user_id)
+        name = message.text.strip()
+        room_code = generate_code()
+        
+        # Создаем комнату, сразу добавляя создателя в список игроков
+        santa_games[room_code] = {
+            "creator_id": user_id,
+            "max_players": count,
+            "players": {user_id: name},
+            "status": "waiting",
+            "creator_msg_id": message.message_id + 1 # Примерно
+        }
+        
+        # Отправляем новое сообщение с кодом комнаты
+        msg = await message.answer(
+            f"✅ Комната создана!\n\n"
+            f"Код комнаты: <code>{room_code}</code>\n"
+            f"Количество участников: {count}\n\n"
+            f"Скинь этот код друзьям. Они должны нажать «Войти в комнату» и ввести его.\n\n"
+            f"👥 Участники (1/{count}):\n• {name}",
+            parse_mode="HTML"
+        )
+        # Обновляем ID сообщения
+        santa_games[room_code]["creator_msg_id"] = msg.message_id
+        
+        # Если вдруг count = 1 (хотя мы ограничили от 2), то сразу старт
+        if count == 1:
+             await start_santa_game(room_code, santa_games[room_code])
+        return
+
+    # --- Ожидание кода Тайного Санты ---
+    if waiting_for_santa_code.get(user_id):
+        waiting_for_santa_code.pop(user_id, None)
+        room_code = message.text.strip().upper()
+        
+        if room_code not in santa_games:
+            await message.answer("❌ Комната не найдена. Проверь код.")
+            return
+            
+        game = santa_games[room_code]
+        if game["status"] != "waiting":
+            await message.answer("❌ Игра уже началась, входить поздно.")
+            return
+            
+        if user_id in game["players"]:
+            await message.answer("❌ Ты уже в этой комнате.")
+            return
+
+        waiting_for_santa_name[user_id] = room_code
+        await message.answer("🎅 Как тебя зовут? Напиши своё имя:")
+        return
+
+    # --- Ожидание имени УЧАСТНИКА ---
+    if user_id in waiting_for_santa_name:
+        room_code = waiting_for_santa_name[user_id]
+        name = message.text.strip()
+        
+        if room_code not in santa_games:
+            await message.answer("❌ Комната не найдена.")
+            del waiting_for_santa_name[user_id]
+            return
+            
+        game = santa_games[room_code]
+        
+        if name in game["players"].values():
+            await message.answer(f"❌ Имя «{name}» уже занято. Введи другое.")
+            return
+            
+        # Добавляем игрока
+        game["players"][user_id] = name
+        del waiting_for_santa_name[user_id]
+        
+        # Обновляем сообщение у создателя
+        creator_id = game["creator_id"]
+        creator_msg_id = game["creator_msg_id"]
+        count = game["max_players"]
+        
+        players_list = "\n".join([f"• {n}" for n in game["players"].values()])
+        text = (
+            f"✅ Комната создана!\n\n"
+            f"Код комнаты: <code>{room_code}</code>\n"
+            f"Количество участников: {count}\n\n"
+            f"Скинь этот код друзьям. Они должны нажать «Войти в комнату» и ввести его.\n\n"
+            f"👥 Участники ({len(game['players'])}/{count}):\n{players_list}"
+        )
+        
+        try:
+            await bot.edit_message_text(
+                chat_id=creator_id,
+                message_id=creator_msg_id,
+                text=text,
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass 
+        
+        await message.answer(f"✅ Ты в игре, {name}!\n\nЖдём остальных...")
+        
+        # Проверяем, все ли зашли
+        if len(game["players"]) == game["max_players"]:
+            game["status"] = "started"
+            await start_santa_game(room_code, game)
+        return
+
+    # --- Ввод для Цифрового Wordle ---
     if user_id in wordle_games:
         guess = message.text.strip()
         if len(guess) != 4 or not guess.isdigit():
@@ -258,6 +435,35 @@ async def handle_all_text_input(message: types.Message):
                 conn.commit()
                 conn.close()
             return
+
+# Вспомогательная функция для запуска Санты
+async def start_santa_game(room_code, game):
+    user_ids = list(game["players"].keys())
+    names = list(game["players"].values())
+    shuffled_names = names[1:] + [names[0]]
+    
+    for i, uid in enumerate(user_ids):
+        target_name = shuffled_names[i]
+        try:
+            await bot.send_message(
+                uid,
+                f"🎅 <b>Тайный Санта начался!</b> 🎄\n\n"
+                f"Ты даришь подарок: <b>{target_name}</b>!\n\n"
+                f"🤫 Только тссс, никому не говори!",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    
+    try:
+        await bot.edit_message_text(
+            chat_id=game["creator_id"],
+            message_id=game["creator_msg_id"],
+            text="🎉 <b>Все собрались!</b> Имена распределены. Каждый участник получил имя в личку.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
 # ==========================================
 # ЛОГИКА СЕТЕВЫХ КРЕСТИКОВ-НОЛИКОВ
